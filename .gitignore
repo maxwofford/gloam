@@ -1,0 +1,2 @@
+# ignore any git log files from local development
+*.log
