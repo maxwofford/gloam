@@ -386,12 +386,29 @@ function layoutTree(root) {
   const nodes = [];
   const edges = [];
 
+  const FILE_AREA = Math.PI * 4 * 4;
+  const DIR_PADDING = 1.5;
+
   function leafCount(n) {
     if (n._lc !== undefined) return n._lc;
     const kids = [...n.children.values()].filter(c => !c.deleted);
     n._lc = kids.length === 0 ? 1 : kids.reduce((s, c) => s + leafCount(c), 0);
     return n._lc;
   }
+
+  // compute area-based radius for a tree node (before flattening)
+  function treeArea(n) {
+    if (n._area !== undefined) return n._area;
+    const kids = [...n.children.values()].filter(c => !c.deleted);
+    const files = kids.filter(c => !c.isDir);
+    const dirs = kids.filter(c => c.isDir);
+    const fileArea = FILE_AREA * files.length;
+    n._area = fileArea + dirs.reduce((s, c) => s + treeArea(c), 0);
+    n._fileArea = fileArea;
+    return n._area;
+  }
+  function treeRadius(n) { return Math.max(15, Math.sqrt(treeArea(n)) * DIR_PADDING); }
+  function treeParentRadius(n) { return Math.max(1, Math.sqrt(n._fileArea || 0)) * DIR_PADDING; }
 
   // root
   nodes.push({
@@ -423,7 +440,7 @@ function layoutTree(root) {
       const lc = leafCount(c);
       const span = (aEnd - aStart) * lc / dirTotal;
       const mid = angle + span / 2;
-      const edgeLen = 80 + Math.sqrt(lc) * 25;
+      const edgeLen = treeRadius(c) + treeParentRadius(node);
       const x = px + Math.cos(mid) * edgeLen;
       const y = py + Math.sin(mid) * edgeLen;
 
@@ -458,27 +475,75 @@ function recomputeLeafCounts() {
 
 function computeClusterRadii() {
   recomputeLeafCounts();
-  const counts = new Map();
+  // gource-style area-based radii
+  const FILE_AREA = Math.PI * 4 * 4; // π * (diameter/2)², diameter=8
+  const DIR_PADDING = 1.5;
+
+  // count direct visible files per dir
+  const fileCounts = new Map();
   for (const n of nodes) {
-    if (!n.isDir && !n.deleted) counts.set(n.dirIdx, (counts.get(n.dirIdx)||0)+1);
+    if (!n.isDir && !n.deleted) fileCounts.set(n.dirIdx, (fileCounts.get(n.dirIdx)||0)+1);
   }
-  for (const [di, count] of counts) {
-    const sp = 13;
-    let shell = 1, placed = 0;
-    while (placed < count) {
-      const r = 10 + shell * sp;
-      placed += Math.min(Math.max(1, Math.floor(2*Math.PI*r/sp)), count-placed);
-      shell++;
+
+  // compute dir_area bottom-up (need child order)
+  // first pass: direct file area for each dir
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (n.deleted) { n.cr = 20; n.pr = 20; continue; }
+    const fc = fileCounts.get(i) || 0;
+    n._fileArea = FILE_AREA * fc;
+    n._dirArea = n._fileArea; // will add children in second pass
+    // parent_radius: based on direct files only (like gource)
+    n.pr = Math.max(1, Math.sqrt(n._fileArea)) * DIR_PADDING;
+  }
+
+  // second pass: accumulate child areas bottom-up (deepest first)
+  for (const i of _dirIdx) {
+    let d = 0; for (let c = i; c >= 0; c = nodes[c].parentIdx) d++;
+    nodes[i]._depth = d;
+  }
+  const byDepth = _dirIdx.slice().sort((a, b) => nodes[b]._depth - nodes[a]._depth);
+  for (const i of byDepth) {
+    const n = nodes[i];
+    if (n.deleted) continue;
+    // add this dir's area to parent
+    if (n.parentIdx >= 0 && !nodes[n.parentIdx].deleted) {
+      nodes[n.parentIdx]._dirArea += n._dirArea;
     }
-    nodes[di].cr = 10 + (shell-1)*sp + 6;
+  }
+
+  // final: dir_radius from total area (used for repulsion)
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (n.deleted) continue;
+    n.cr = Math.max(15, Math.sqrt(n._dirArea) * DIR_PADDING);
   }
 }
 
 let _dirIdx = []; // cached dir indices
-let alpha = 1.0;  // annealing temperature: starts hot, cools to frozen
+let alpha = 1.0;  // annealing: visual heat indicator, cooling control
+let _ancestors = new Map(); // cached ancestor sets (rebuilt on tree change)
+let _ancestorsDirty = true;
+
+function rebuildAncestors() {
+  _ancestors.clear();
+  for (const i of _dirIdx) {
+    const s = new Set();
+    for (let c = nodes[i].parentIdx; c >= 0; c = nodes[c].parentIdx) s.add(c);
+    _ancestors.set(i, s);
+  }
+  _ancestorsDirty = false;
+}
 
 function physicsStep(cool) {
-  // spring: dirs toward parent (full strength, gated by maturity only)
+  // === STATELESS PHYSICS (like gource) — no velocity, no momentum ===
+  // reset accelerations fresh each step
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (!n.deleted) { n.ax = 0; n.ay = 0; }
+  }
+
+  // 1. spring: pull toward parent at rest distance = sum of radii (like gource)
   for (const i of _dirIdx) {
     const n = nodes[i];
     if (n.deleted || n.parentIdx < 0) continue;
@@ -486,78 +551,150 @@ function physicsStep(cool) {
     const p = nodes[n.parentIdx];
     const dx = n.x - p.x, dy = n.y - p.y;
     const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
-    const target = 80 + Math.sqrt(n.lc || 1) * 25;
-    const f = (d - target) * 0.03 * mat;
-    const fx = (dx/d)*f, fy = (dy/d)*f;
-    n.vx -= fx; n.vy -= fy;
-    p.vx += fx*0.3; p.vy += fy*0.3;
+    const target = (n.cr || 20) + (p.pr || 20);
+    const f = (d - target) * 10.0 * mat;
+    n.ax -= (dx/d)*f; n.ay -= (dy/d)*f;
+    p.ax += (dx/d)*f*0.3; p.ay += (dy/d)*f*0.3;
   }
 
-  // dir repulsion — ALWAYS full strength (not scaled by alpha)
-  // skip ancestor/descendant pairs (like gource)
-  for (let i = 0; i < _dirIdx.length; i++) {
-    const ai = _dirIdx[i];
-    const a = nodes[ai];
-    if (a.deleted) continue;
+  // 2. grandparent orbital: push to parent edge along grandparent→parent axis (like gource)
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (n.deleted || n.parentIdx < 0) continue;
+    const mat = Math.min(1, (n.physAge || 0) / 180);
+    const p = nodes[n.parentIdx];
+    if (p.parentIdx < 0) continue;
+    const gp = nodes[p.parentIdx];
+    const edx = p.x - gp.x, edy = p.y - gp.y;
+    const ed = Math.sqrt(edx*edx + edy*edy) || 0.001;
+    const target = (p.pr || 20) + (n.cr || 20);
+    const tx = p.x + (edx/ed) * target;
+    const ty = p.y + (edy/ed) * target;
+    // full displacement as force (gource: accel += dest - pos)
+    n.ax += (tx - n.x) * mat;
+    n.ay += (ty - n.y) * mat;
+  }
+
+  // 3. overlap repulsion (like gource: skip ancestors/descendants, but DO repel parent↔child)
+  // parent↔child overlap — use pr (files-only) for parent side to match spring target
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (n.deleted || n.parentIdx < 0) continue;
+    const mat = Math.min(1, (n.physAge || 0) / 180);
+    const p = nodes[n.parentIdx];
+    const dx = p.x - n.x, dy = p.y - n.y;
+    const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
+    const minDist = (n.cr || 20) + (p.pr || 20);
+    if (d < minDist) {
+      const overlap = d - minDist; // negative
+      n.ax += (dx/d) * overlap * mat;
+      n.ay += (dy/d) * overlap * mat;
+    }
+  }
+  // use cached ancestor sets (rebuilt when tree structure changes)
+  if (_ancestorsDirty) rebuildAncestors();
+  // spatial hash grid for non-ancestor pair repulsion
+  // cell size = max radius * 2 so overlapping nodes are always in same or adjacent cells
+  let maxR = 40;
+  for (const i of _dirIdx) { if (!nodes[i].deleted) maxR = Math.max(maxR, nodes[i].cr || 20); }
+  const cell = maxR * 2;
+  const grid = new Map();
+  const alive = [];
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (n.deleted) continue;
+    alive.push(i);
+    const cx = Math.floor(n.x / cell), cy = Math.floor(n.y / cell);
+    const key = cx * 73856093 ^ cy * 19349669;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  }
+  // check each node against its 3x3 neighborhood
+  for (const i of alive) {
+    const a = nodes[i];
     const ar = a.cr || 20;
     const matA = Math.min(1, (a.physAge || 0) / 180);
-    for (let j = i+1; j < _dirIdx.length; j++) {
-      const bi = _dirIdx[j];
-      const b = nodes[bi];
-      if (b.deleted) continue;
-      let skip = false;
-      for (let c = bi; c >= 0; c = nodes[c].parentIdx) { if (c === ai) { skip = true; break; } }
-      if (!skip) for (let c = ai; c >= 0; c = nodes[c].parentIdx) { if (c === bi) { skip = true; break; } }
-      if (skip) continue;
-      const dx = b.x-a.x, dy = b.y-a.y;
-      const d = Math.sqrt(dx*dx+dy*dy) || 0.001;
-      const minDist = ar + (b.cr || 20) + 30;
-      if (d < minDist) {
-        const matB = Math.min(1, (b.physAge || 0) / 180);
-        const baseF = (minDist-d) * 0.015 / d;
-        // asymmetric: settled nodes push new ones hard,
-        // new nodes nudge settled ones gently
-        a.vx -= dx * baseF * (0.15 + 0.85 * matB); a.vy -= dy * baseF * (0.15 + 0.85 * matB);
-        b.vx += dx * baseF * (0.15 + 0.85 * matA); b.vy += dy * baseF * (0.15 + 0.85 * matA);
+    const cx = Math.floor(a.x / cell), cy = Math.floor(a.y / cell);
+    const ancA = _ancestors.get(i);
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        const key = gx * 73856093 ^ gy * 19349669;
+        const bucket = grid.get(key);
+        if (!bucket) continue;
+        for (const j of bucket) {
+          if (j <= i) continue; // each pair checked once
+          // skip ancestor/descendant pairs
+          if (ancA.has(j) || _ancestors.get(j).has(i)) continue;
+          const b = nodes[j];
+          const dx = b.x-a.x, dy = b.y-a.y;
+          const d = Math.sqrt(dx*dx+dy*dy) || 0.001;
+          const minDist = ar + (b.cr || 20);
+          if (d < minDist) {
+            const overlap = minDist - d;
+            const matB = Math.min(1, (b.physAge || 0) / 180);
+            a.ax -= (dx/d)*overlap*(0.15+0.85*matB);
+            a.ay -= (dy/d)*overlap*(0.15+0.85*matB);
+            b.ax += (dx/d)*overlap*(0.15+0.85*matA);
+            b.ay += (dy/d)*overlap*(0.15+0.85*matA);
+          }
+        }
       }
     }
   }
 
-  // centering on root, gentle outward push on everything else
+  // 4. sibling angular spreading (gource style)
+  const byParent = new Map();
+  for (const i of _dirIdx) {
+    const n = nodes[i];
+    if (n.deleted || n.parentIdx < 0) continue;
+    if (!byParent.has(n.parentIdx)) byParent.set(n.parentIdx, []);
+    byParent.get(n.parentIdx).push(i);
+  }
+  for (const [pi, sibs] of byParent) {
+    if (sibs.length < 2) continue;
+    const pr = nodes[pi].pr || 20;
+    const slice = Math.max(15, pr * Math.PI) / (sibs.length + 1);
+    for (let i = 0; i < sibs.length; i++) {
+      const a = nodes[sibs[i]];
+      let sx = 0, sy = 0;
+      for (let j = 0; j < sibs.length; j++) {
+        if (i === j) continue;
+        const b = nodes[sibs[j]];
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
+        sx += dx/d; sy += dy/d;
+      }
+      a.ax += sx * slice; a.ay += sy * slice;
+    }
+  }
+
+  // 5. root centering + leaf outward push
   const root = nodes[0];
   for (const i of _dirIdx) {
     const n = nodes[i];
     if (n.deleted) continue;
     if (n.parentIdx < 0) {
-      n.vx -= n.x * 0.005; n.vy -= n.y * 0.005;
+      n.ax -= n.x * 1.0; n.ay -= n.y * 1.0;
     } else {
-      // leaf dirs push away from root — stretches the tree taut from the tips
       const hasChildDir = _dirIdx.some(j => !nodes[j].deleted && nodes[j].parentIdx === i);
       if (!hasChildDir) {
         const mat = Math.min(1, (n.physAge || 0) / 180);
-        const push = 0.05 + (1 - mat) * 0.05; // 0.1 when new, 0.05 when settled
+        const push = 1.0 + (1 - mat) * 1.0;
         const dx = n.x - root.x, dy = n.y - root.y;
         const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
-        n.vx += (dx/d) * push; n.vy += (dy/d) * push;
+        n.ax += (dx/d) * push; n.ay += (dy/d) * push;
       }
     }
   }
 
-  // integrate: alpha controls velocity cap — slow drift when cold, active when hot
-  const maxV = 0.5 + 7 * alpha;
+  // 6. integrate: pos += accel * dt — fixed dt like gource (1/60)
+  const dt = 1.0 / 60.0;
   for (const i of _dirIdx) {
     const n = nodes[i];
     if (n.deleted) continue;
-    n.vx *= 0.85; n.vy *= 0.85;
-    const speed = Math.sqrt(n.vx*n.vx + n.vy*n.vy);
-    if (speed > maxV) { n.vx *= maxV/speed; n.vy *= maxV/speed; }
-    n.x += n.vx; n.y += n.vy;
-  }
-
-  // age up dir nodes (maturity ramp)
-  for (const i of _dirIdx) {
-    const n = nodes[i];
-    if (!n.deleted) n.physAge = (n.physAge || 0) + 1;
+    n.x += n.ax * dt;
+    n.y += n.ay * dt;
+    n.physAge = (n.physAge || 0) + 1;
   }
 
   if (cool) alpha *= 0.997;
@@ -640,16 +777,16 @@ function autoZoom() {
   );
 }
 
-function loadTree(tree, warmup = 600) {
+function loadTree(tree) {
   const result = layoutTree(tree);
   nodes = result.nodes;
   edges = result.edges;
   _dirIdx = [];
   for (let i = 0; i < nodes.length; i++) if (nodes[i].isDir) _dirIdx.push(i);
   computeClusterRadii();
+  _ancestorsDirty = true;
   alpha = 1.0;
   t0 = performance.now() / 1000;
-  for (let i = 0; i < warmup; i++) physicsStep(false);
   autoZoom();
 }
 
@@ -667,7 +804,7 @@ const tlDate = document.getElementById('tl-date');
 function updateTimeline() {
   if (allCommits.length === 0) return;
   const c = allCommits[Math.max(0, commitIdx - 1)];
-  tlInfo.textContent = `commit ${commitIdx} / ${allCommits.length}`;
+  tlInfo.textContent = `commit ${commitIdx} / ${allCommits.length}  [${playSpeed}x]`;
   if (c) {
     const d = new Date(c.timestamp * 1000);
     tlDate.textContent = `${d.toLocaleDateString()} — ${c.author}`;
@@ -759,7 +896,15 @@ function applyCommit(commit) {
         // file exists — undelete or pulse on modify
         const n = nodes[pathToNode.get(act.path)];
         if (n.deleted) { n.deleted = false; n.birth = now; }
-        else n.touchTime = now; // bloom pulse (not full birth)
+        else {
+          n.touchTime = now; // bloom pulse on file
+          // propagate touch up to root for edge glow trace
+          let hop = 0;
+          for (let ci = n.dirIdx; ci >= 0; ci = nodes[ci].parentIdx) {
+            nodes[ci].edgeTouchTime = now + hop * 0.08; // staggered pulse
+            hop++;
+          }
+        }
       }
     } else if (act.type === 'D') {
       if (pathToNode.has(act.path)) {
@@ -769,29 +914,39 @@ function applyCommit(commit) {
 
   }
   // clean up empty dirs (git doesn't track them)
+  // build sets for O(1) lookups instead of O(n) scans
+  const dirsWithFiles = new Set();
+  const dirsWithSubdirs = new Set();
+  for (const n of nodes) {
+    if (n.deleted) continue;
+    if (!n.isDir) dirsWithFiles.add(n.dirIdx);
+    else if (n.parentIdx >= 0) dirsWithSubdirs.add(n.parentIdx);
+  }
   let changed = true;
   while (changed) {
     changed = false;
     for (const i of _dirIdx) {
       const n = nodes[i];
       if (n.deleted || n.parentIdx < 0) continue;
-      const hasFile = nodes.some(o => !o.isDir && !o.deleted && o.dirIdx === i);
-      const hasSubdir = nodes.some(o => o.isDir && !o.deleted && o.parentIdx === i);
-      if (!hasFile && !hasSubdir) { n.deleted = true; changed = true; }
+      if (!dirsWithFiles.has(i) && !dirsWithSubdirs.has(i)) {
+        n.deleted = true; changed = true;
+        dirsWithSubdirs.delete(i); // parent may now be empty too
+      }
     }
   }
 
   // reheat so new nodes settle
   alpha = Math.max(alpha, 0.5);
   computeClusterRadii();
+  _ancestorsDirty = true;
 }
 
 function scrubTo(idx) {
   idx = Math.max(0, Math.min(idx, allCommits.length));
   if (idx <= commitIdx || (idx - commitIdx) > 50) {
-    // rebuild: use proper radial layout + full physics
+    // rebuild: use proper radial layout + physics warmup
     const tree = buildTreeFromCommits(allCommits, idx);
-    loadTree(tree, 600);
+    loadTree(tree);
     // reconstruct pathToNode from node paths for future incremental use
     pathToNode = new Map();
     for (let i = 0; i < nodes.length; i++) {
@@ -912,10 +1067,17 @@ function render() {
         const heat = Math.min(1, alpha * 1.5);
         const mat = Math.min(1, (nb.physAge || 0) / 300);
         const bright = 1.2 - mat * 0.5; // new=1.2, mature=0.7
-        eData[o+4] = (0.7 + heat * 0.3) * bright;
-        eData[o+5] = (0.35 + heat * 0.5) * bright;
-        eData[o+6] = (0.1 + heat * 0.2) * bright;
-        eData[o+7] = Math.min(1, age) * 0.6;
+        // edge glow trace: flash when child was recently touched
+        let pulse = 0;
+        if (nb.edgeTouchTime) {
+          const pt = now - nb.edgeTouchTime;
+          if (pt > 0 && pt < 0.8) pulse = 1 - pt / 0.8; // fade over 0.8s
+        }
+        const pr = pulse * 1.5; // intensity boost
+        eData[o+4] = (0.7 + heat * 0.3) * bright + pr * 0.6;
+        eData[o+5] = (0.35 + heat * 0.5) * bright + pr * 0.45;
+        eData[o+6] = (0.1 + heat * 0.2) * bright + pr * 0.15;
+        eData[o+7] = Math.min(1, age) * 0.6 + pulse * 0.4;
         ve++;
       }
       if (ve > 0) {
@@ -1013,8 +1175,14 @@ addEventListener('keydown', e => {
     playing = !playing;
     playAccum = 0;
   }
-  if (e.code === 'Equal' || e.code === 'NumpadAdd') playSpeed = Math.min(30, playSpeed + 1);
-  if (e.code === 'Minus' || e.code === 'NumpadSubtract') playSpeed = Math.max(1, playSpeed - 1);
+  if (e.code === 'Equal' || e.code === 'NumpadAdd') {
+    playSpeed = Math.min(500, playSpeed < 10 ? playSpeed + 1 : Math.floor(playSpeed * 1.5));
+    updateTimeline();
+  }
+  if (e.code === 'Minus' || e.code === 'NumpadSubtract') {
+    playSpeed = Math.max(1, playSpeed > 10 ? Math.ceil(playSpeed / 1.5) : playSpeed - 1);
+    updateTimeline();
+  }
 });
 
 // --- UI: drag-drop on hover ---
